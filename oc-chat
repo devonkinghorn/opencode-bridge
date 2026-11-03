@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # oc-chat: talk to an opencode session like a chat, printing only user/assistant text.
 # Usage: oc-chat [-C dir] <session id | title substring> [--tail N|all] [--since N] [--full] [message...]
-#   message      send it, wait for the run to finish, print everything after it
 #   message      send it to the session, wait for the run to finish, then print everything after it was sent
 #   --since N    print messages numbered > N (use the "last=#N" from the previous call so nothing is skipped)
 #   --tail N|all print the last N messages (default 5 when only reading), or the whole chat
@@ -14,7 +13,7 @@ while [ $# -gt 0 ]; do
     --tail) tail="$2"; shift 2;;
     --since) since="$2"; shift 2;;
     --full) full=1; shift;;
-    -h|--help) sed -n 2,8p "$0"; exit 0;;
+    -h|--help) sed -n 2,7p "$0"; exit 0;;
     *) if [ -z "$sess" ]; then sess="$1"; else msg+=("$1"); fi; shift;;
   esac
 done
