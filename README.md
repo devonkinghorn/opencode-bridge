@@ -1,6 +1,8 @@
-# opencode-tail
+# opencode-bridge
 
-`oc-chat` is a tiny bash + jq wrapper that lets you (or another AI agent) talk to an existing [opencode](https://opencode.ai) session like a chat. It prints only user messages and assistant text, numbered, so a reader never skips anything and spends few tokens.
+A bridge that lets **Codex, Grok Bot, and other desktop AI tools do coding work through [opencode](https://opencode.ai)**. Another agent can start an opencode session, send it instructions, and read back what it said, without having to parse opencode's full JSON or spend tokens on tool calls and reasoning.
+
+`opencode-bridge` is a single bash + jq script. It prints only user messages and assistant text, and numbers every message so the calling agent never skips anything, including messages you type into the opencode TUI yourself.
 
 Example output (illustrative):
 
@@ -19,42 +21,48 @@ last=#43 session=ses_abc123
 Requires `opencode`, `jq`, and bash.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/devonkinghorn/opencode-tail/main/oc-chat -o ~/.local/bin/oc-chat
-chmod +x ~/.local/bin/oc-chat
+curl -fsSL https://raw.githubusercontent.com/devonkinghorn/opencode-bridge/main/opencode-bridge -o ~/.local/bin/opencode-bridge
+chmod +x ~/.local/bin/opencode-bridge
 ```
 
 ## Usage
 
 ```
-oc-chat [-C dir] <session id | title substring> [--tail N|all] [--since N] [--full] [message...]
+opencode-bridge [-C dir] <session id | title substring> [options] [message...]
+opencode-bridge [-C dir] --new [--title T] [options] <message...>
 ```
 
 | Command | What it does |
 |---|---|
-| `oc-chat "my feature" --tail 5` | Last 5 messages of the session whose title matches "my feature" (default when only reading) |
-| `oc-chat <id> --tail all` | The whole chat |
-| `oc-chat <id> --since 330` | Every message after #330 |
-| `oc-chat <id> "run the tests"` | Send a message, wait for the run to finish, print everything after it |
-| `--full` | Also show truncated reasoning and tool calls |
-| `-C dir` | Project directory (opencode lists sessions per project) |
+| `opencode-bridge --new --title "auth refactor" --mode plan "plan the auth refactor"` | Start a new session in plan mode and print its reply and session id |
+| `opencode-bridge "auth refactor" "now implement step 1"` | Send to the session whose title matches, wait, print everything after the message |
+| `opencode-bridge <id> --no-wait "run the full test suite"` | Send and return immediately; collect the reply later with `--since` |
+| `opencode-bridge <id> --timeout 120 "fix the failing test"` | Wait up to 120 s; if it's still working, print what's there and say so |
+| `opencode-bridge <id> --since 41` | Every message after #41 |
+| `opencode-bridge <id> --tail 5` / `--tail all` | Last 5 messages (default when only reading) / the whole chat |
 
-Every call ends with `last=#N`. Pass that back as `--since N` next time, and you'll see any messages typed into the session in between too.
+Options:
 
-## Use it from Grok Bot (or another AI agent)
+- `--mode NAME` sets the opencode agent (mode) for the run, such as `build` or `plan`. It's passed to `opencode run --agent`.
+- `--model provider/model` sets the model for the run.
+- `--full` also shows truncated reasoning and tool calls.
+- `-C dir` sets the project directory, since opencode lists sessions per project.
 
-[`skills/opencode-chat/SKILL.md`](skills/opencode-chat/SKILL.md) is a ready-made skill that teaches an agent to read and reply to your opencode sessions through `oc-chat`.
+Every call ends with `last=#N`. Pass that back as `--since N` next time, and you'll see anything that happened in between. For long jobs, use `--no-wait` or `--timeout` and check back with `--since`. The opencode run keeps going after the bridge returns.
 
-To add it in Grok Bot, paste this into a chat with your bot:
+## Use it from Grok Bot, Codex, or another agent
 
-> Save this as a skill: https://raw.githubusercontent.com/devonkinghorn/opencode-tail/main/skills/opencode-chat/SKILL.md
+[`skills/opencode-bridge/SKILL.md`](skills/opencode-bridge/SKILL.md) is a ready-made skill that teaches an agent to drive opencode through this bridge.
 
-Then just ask, for example "check what my opencode session 'auth refactor' said since we last looked" or "tell my opencode session to run the tests." The bot installs `oc-chat` where opencode runs if it isn't there yet. It keeps track of the last message number so it never skips anything you typed in between, and it only relays what you ask it to.
+- **Grok Bot:** paste this into a chat with your bot:
+  > Save this as a skill: https://raw.githubusercontent.com/devonkinghorn/opencode-bridge/main/skills/opencode-bridge/SKILL.md
 
-The skill file uses the standard `SKILL.md` format (YAML frontmatter plus markdown), so other agents that support skills, such as Claude Code (`~/.claude/skills/`), can use it as-is.
+  Then ask things like "start an opencode session in plan mode to design the retry logic" or "check what my opencode session 'auth refactor' said since we last looked."
+- **Codex, Claude Code, and other agents with skills:** the file uses the standard `SKILL.md` format (YAML frontmatter plus markdown), so you can drop it into that tool's skills folder. Or just tell the agent to run `opencode-bridge --help`.
 
 ## How it works
 
-It reads `opencode session export <id>` and numbers messages by their position, then uses `opencode run --session <id>` to send. It was written against opencode v2.2.0's export format. If a later version changes that format, adjust the jq filter.
+It reads `opencode session export <id>` and numbers messages by their position, and it sends with `opencode run` (`--session` to continue, `--agent` for the mode). Background runs are detached with `setsid nohup`, and their output goes to a temp log. It was written against opencode v2.2.0's export format. If a later version changes that format, adjust the jq filter.
 
 ## License
 

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# opencode-bridge: lets other tools (Codex, Grok Bot, desktop agents) read and message an opencode session,
+# printing only numbered user/assistant text.
+# Usage: opencode-bridge [-C dir] <session id | title substring> [options] [message...]
+#        opencode-bridge [-C dir] --new [--title T] [options] <message...>
+#   message        send it, wait for the run, then print everything after it was sent
+#   --new          start a new session with the message (prints its session id)
+#   --title T      title for a --new session
+#   --mode NAME    opencode agent/mode to use for the run (e.g. build, plan)
+#   --model P/M    model to use for the run (provider/model)
+#   --no-wait      send and return immediately; collect the reply later with --since
+#   --timeout S    wait at most S seconds; if still running, print what's there and say so
+#   --since N      print messages numbered > N (pass the "last=#N" from the previous call)
+#   --tail N|all   print the last N messages (default 5 when only reading), or the whole chat
+#   --full         also show reasoning and tool calls (truncated)
+set -euo pipefail
+dir="$PWD"; tail=""; since=""; full=0; sess=""; msg=(); new=0; title=""; mode=""; model=""; timeout=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C) dir="$2"; shift 2;;
+    --tail) tail="$2"; shift 2;;
+    --since) since="$2"; shift 2;;
+    --full) full=1; shift;;
+    --new) new=1; shift;;
+    --title) title="$2"; shift 2;;
+    --mode|--agent) mode="$2"; shift 2;;
+    --model) model="$2"; shift 2;;
+    --no-wait) timeout=0; shift;;
+    --timeout) timeout="$2"; shift 2;;
+    -h|--help) sed -n 2,16p "$0"; exit 0;;
+    *) if [ "$new" = 0 ] && [ -z "$sess" ]; then sess="$1"; else msg+=("$1"); fi; shift;;
+  esac
+done
+cd "$dir"
+ids() { opencode session list 2>/dev/null | cut -f1 | sort; }
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+count() { opencode session export "$1" >"$tmp" 2>/dev/null && jq '.messages|length' "$tmp" || echo 0; }
+
+if [ "$new" = 1 ]; then
+  [ ${#msg[@]} -gt 0 ] || { echo "--new needs a message" >&2; exit 2; }
+else
+  [ -n "$sess" ] || { echo "need a session id or title (or --new)" >&2; exit 2; }
+  if [[ "$sess" != ses_* ]]; then
+    id=$(opencode session list 2>/dev/null | grep -iF -- "$sess" | head -1 | cut -f1)
+    [ -n "$id" ] || { echo "no session matching '$sess' in $dir" >&2; exit 1; }
+    sess="$id"
+  fi
+fi
+
+running=0
+if [ ${#msg[@]} -gt 0 ]; then
+  args=()
+  [ -n "$mode" ] && args+=(--agent "$mode")
+  [ -n "$model" ] && args+=(--model "$model")
+  if [ "$new" = 1 ]; then
+    [ -n "$title" ] && args+=(--title "$title")
+    old=$(ids); since=0
+  else
+    args+=(--session "$sess")
+    [ -n "$since" ] || since=$(count "$sess")
+  fi
+  log=$(mktemp -t opencode-bridge.XXXXXX.log)
+  launcher=(nohup); command -v setsid >/dev/null && launcher=(setsid nohup)
+  "${launcher[@]}" opencode run "${args[@]}" "${msg[*]}" >"$log" 2>&1 </dev/null &
+  pid=$!
+  if [ "$new" = 1 ]; then
+    for _ in $(seq 1 60); do
+      sess=$(comm -13 <(echo "$old") <(ids) | head -1)
+      [ -n "$sess" ] && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    [ -n "$sess" ] || { echo "could not find the new session id (log: $log)" >&2; exit 1; }
+  fi
+  waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ -n "$timeout" ] && [ "$waited" -ge "$timeout" ]; then running=1; break; fi
+    sleep 1; waited=$((waited+1))
+  done
+  if [ "$running" = 0 ]; then
+    wait "$pid" || echo "(opencode run exited with an error; log: $log)" >&2
+  fi
+fi
+
+opencode session export "$sess" >"$tmp" 2>/dev/null
+total=$(jq '.messages|length' "$tmp")
+if [ -n "$since" ]; then start="$since"
+elif [ "$tail" = "all" ]; then start=0
+else start=$(( total - ${tail:-5} )); [ "$start" -lt 0 ] && start=0; fi
+jq -r --argjson start "$start" --argjson full "$full" '
+  .messages | to_entries[] | select(.key >= $start) | .key as $k | .value as $m
+  | if $m.type == "user" then
+      ($m.text // "") as $t | select($t != "") | "#\($k+1) [user]\n\($t)\n"
+    elif $m.type == "assistant" then
+      ([$m.content[]? |
+        if .type == "text" then .text
+        elif $full == 1 and .type == "reasoning" then "(thinking) " + ((.text // "")[0:300])
+        elif $full == 1 and .type == "tool" then "(tool) " + ((.tool // .name // "") | tostring) + " " + ((.input // .state.input // {} | tostring)[0:200])
+        else empty end] | map(select(. != "")) | join("\n")) as $t
+      | select($t != "") | "#\($k+1) [assistant]\n\($t)\n"
+    else empty end' "$tmp"
+[ "$running" = 1 ] && echo "(still running; check again with --since $total)"
+echo "last=#$total session=$sess"
