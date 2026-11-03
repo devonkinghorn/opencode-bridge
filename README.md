@@ -2,14 +2,16 @@
 
 `oc-chat` is a tiny bash + jq wrapper that lets you (or another AI agent) talk to an existing [opencode](https://opencode.ai) session like a chat. It prints only user messages and assistant text, numbered, so a reader never skips anything and spends few tokens.
 
+Example output (illustrative):
+
 ```
-#331 [assistant]
-Both Sets returned in about 2 seconds. I'll check the driver log before calling that.
+#41 [user]
+run the tests and tell me what fails
 
-#332 [user]
-ok push to gh
+#42 [assistant]
+All 118 tests pass except `lock.test.ts > retries on timeout`, which expects 3 attempts and gets 2.
 
-last=#333 session=ses_e61a58e7fffeffjVEELEEVWSrK
+last=#43 session=ses_abc123
 ```
 
 ## Install
@@ -37,6 +39,18 @@ oc-chat [-C dir] <session id | title substring> [--tail N|all] [--since N] [--fu
 | `-C dir` | Project directory (opencode lists sessions per project) |
 
 Every call ends with `last=#N`. Pass that back as `--since N` next time, and you'll see any messages typed into the session in between too.
+
+## Use it from Grok Bot (or another AI agent)
+
+[`skills/opencode-chat/SKILL.md`](skills/opencode-chat/SKILL.md) is a ready-made skill that teaches an agent to read and reply to your opencode sessions through `oc-chat`.
+
+To add it in Grok Bot, paste this into a chat with your bot:
+
+> Save this as a skill: https://raw.githubusercontent.com/devonkinghorn/opencode-tail/main/skills/opencode-chat/SKILL.md
+
+Then just ask, for example "check what my opencode session 'auth refactor' said since we last looked" or "tell my opencode session to run the tests." The bot installs `oc-chat` where opencode runs if it isn't there yet. It keeps track of the last message number so it never skips anything you typed in between, and it only relays what you ask it to.
+
+The skill file uses the standard `SKILL.md` format (YAML frontmatter plus markdown), so other agents that support skills, such as Claude Code (`~/.claude/skills/`), can use it as-is.
 
 ## How it works
 
