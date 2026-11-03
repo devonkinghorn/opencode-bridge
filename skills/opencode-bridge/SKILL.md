@@ -23,7 +23,7 @@ description: Use this to do coding work through a local opencode coding agent, b
 
 ## Steps
 1. Decide whether you're starting a new session or continuing one. To find existing sessions, run `opencode session list` in the project dir.
-2. Pick a mode: `plan` to design or review without editing files, or `build` to make changes. Use whichever mode the user asked for.
+2. Pick a mode: `plan` to design or review without editing files, or `build` to make changes. Use whichever mode the user asked for. A session keeps its last mode, so pass `--mode build` explicitly when you switch out of plan.
 3. Read before you send to an existing session (`--since <last>` or `--tail 3`).
 4. Send only what the user asked for. Keep the message short and self-contained, and say who it's from, for example "Message from <bot> on behalf of <user>: ...".
 5. If your shell commands have a short time limit, use `--no-wait` or `--timeout` and poll with `--since`.

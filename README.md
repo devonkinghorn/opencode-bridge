@@ -43,7 +43,7 @@ opencode-bridge [-C dir] --new [--title T] [options] <message...>
 
 Options:
 
-- `--mode NAME` sets the opencode agent (mode) for the run, such as `build` or `plan`. It's passed to `opencode run --agent`.
+- `--mode NAME` sets the opencode agent (mode) for the run, such as `build` or `plan`. It's passed to `opencode run --agent`. A session keeps its last mode until you pass a different one.
 - `--model provider/model` sets the model for the run.
 - `--full` also shows truncated reasoning and tool calls.
 - `-C dir` sets the project directory, since opencode lists sessions per project.
