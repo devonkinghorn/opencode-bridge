@@ -34,6 +34,29 @@ def handle(msg):
     elif method == "session/prompt":
         sid = params.get("sessionId")
         text = "".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
+        if "FLOW" in text:
+            for piece in ("Hi", " there"):
+                emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": piece}}}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-3", "title": "Run tests", "kind": "execute",
+                "rawInput": {"command": "pytest -q"},
+            }}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "call-3", "status": "completed",
+            }}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "All done"}}}})
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+            return
+        if "HOLD" in text:
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-4", "title": "Edit src/z.ts", "kind": "edit",
+                "rawInput": {"path": "src/z.ts"},
+            }}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "pending_interaction", "tool_call_id": "call-4", "kind": "permission",
+            }}})
+            threading.Event().wait()
+            return
         if "INTERACT" in text:
             for piece in ("Hel", "lo"):
                 emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": piece}}}})

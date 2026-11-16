@@ -88,7 +88,13 @@ Register it in Cursor (or any MCP client) as:
 
 `grok` should be on `PATH`, or set `GROK_BIN` to `~/.grok/bin/grok`. Run `grok login` once. Needs Python 3.9+.
 
-Tools: `new_session`, `load_session`, `prompt`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` returns the assistant text, or a line that starts with `still running` or `waiting for approval`. On grok 1.0.84 the approval is answered in that TUI, not by `respond_approval`. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
+Tools: `new_session`, `load_session`, `prompt`, `wait`, `events`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` with `wait_seconds=0` returns `still running` immediately. That is not finished. Call `wait` (default 30 minutes) or poll `read` until `state=idle`. `wait` also returns when an approval is unresolved (`state=waiting`) or the timeout hits (`state=running` / `still running`). `events` is a numbered one-line feed (`tool`, `tool_status`, `approval`, `assistant`) with `last=#N`. On grok 1.0.84 an approval is answered in the TUI, not by `respond_approval`. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
+
+To run one turn from the shell and print progress as it happens:
+
+```sh
+python3 grok_mcp.py run --session <id> --cwd <dir> --text '...' --follow
+```
 
 ```sh
 python3 -m unittest tests.test_grok_mcp -v

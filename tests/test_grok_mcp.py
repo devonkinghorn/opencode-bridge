@@ -158,5 +158,63 @@ class McpTests(unittest.TestCase):
             proc.stdout.close()
 
 
+    def test_wait_and_events(self):
+        project = tempfile.mkdtemp()
+        env = os.environ.copy()
+        env["GROK_BRIDGE_AGENT"] = f"{sys.executable} {FAKE}"
+        proc = subprocess.Popen(
+            [sys.executable, "-u", str(ROOT / "grok_mcp.py")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=project,
+        )
+        seq = 0
+
+        def tool(name, arguments):
+            nonlocal seq
+            seq += 1
+            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": seq, "method": "tools/call", "params": {"name": name, "arguments": arguments}}) + "\n").encode())
+            proc.stdin.flush()
+            msg = json.loads(proc.stdout.readline())
+            text = msg["result"]["content"][0]["text"]
+            self.assertFalse(msg["result"].get("isError"), text)
+            return text
+
+        try:
+            seq += 1
+            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": seq, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}) + "\n").encode())
+            proc.stdin.flush()
+            proc.stdout.readline()
+            held = tool("new_session", {"cwd": project})
+            hid = held.split("session=", 1)[1].split()[0]
+            self.assertTrue(tool("prompt", {"session_id": hid, "text": "HOLD the turn", "wait_seconds": 0}).startswith("still running"))
+            waiting = tool("wait", {"session_id": hid, "timeout_seconds": 5})
+            self.assertIn("state=waiting", waiting)
+            self.assertIn("Edit src/z.ts", waiting)
+            made = tool("new_session", {"cwd": project, "title": "flow"})
+            fid = made.split("session=", 1)[1].split()[0]
+            self.assertTrue(tool("prompt", {"session_id": fid, "text": "FLOW the tests", "wait_seconds": 0}).startswith("still running"))
+            done = tool("wait", {"session_id": fid, "timeout_seconds": 10})
+            self.assertIn("state=idle", done)
+            self.assertIn("All done", done)
+            ev = tool("events", {"session_id": fid, "since": 0})
+            self.assertIn("pytest -q", ev)
+            self.assertIn("completed", ev)
+            self.assertIn("assistant Hi there", ev)
+            last = int(ev.strip().split("last=#", 1)[1])
+            self.assertTrue(tool("events", {"session_id": fid, "since": last}).startswith("last=#"))
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+            proc.stdin.close()
+            proc.stdout.close()
+
+        cli = subprocess.run(
+            [sys.executable, str(ROOT / "grok_mcp.py"), "run", "--session", "cli-session", "--cwd", project, "--text", "FLOW please", "--follow", "--timeout", "10"],
+            env=env, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(cli.returncode, 0, cli.stdout + cli.stderr)
+        self.assertIn("pytest -q", cli.stdout)
+        self.assertIn("All done", cli.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,14 +12,16 @@ The ext_method list has no x.ai/interaction or resolve_interaction. request_perm
 is still handled if a build sends it.
 """
 
-import json, os, shlex, subprocess, sys, threading, time
+import argparse, json, os, shlex, subprocess, sys, threading, time
 from pathlib import Path
 
 MODES = ("default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan")
 TOOLS = [
     ("new_session", "Create a Grok Build session.", ["cwd", "title", "mode"], ["cwd"]),
     ("load_session", "Load a session by id (TUI sessions too, if ACP allows).", ["session_id", "cwd"], ["session_id", "cwd"]),
-    ("prompt", "Send text. Returns assistant text, 'still running', or 'waiting for approval'.", ["session_id", "text", "wait_seconds"], ["session_id", "text"]),
+    ("prompt", "Send text. wait_seconds=0 returns 'still running' immediately. Otherwise assistant text, 'still running', or 'waiting for approval'.", ["session_id", "text", "wait_seconds"], ["session_id", "text"]),
+    ("wait", "Block until the turn is idle, waiting for approval, or timeout_seconds (default 1800). Returns state and assistant text since the prompt. 'still running' is not finished.", ["session_id", "timeout_seconds"], ["session_id"]),
+    ("events", "One-line progress events since N: tool, tool status, approval, assistant. Ends with last=#N.", ["session_id", "since"], ["session_id"]),
     ("read", "Numbered user/assistant messages. since keeps n > since.", ["session_id", "since"], ["session_id"]),
     ("pending_approvals", "Parked approvals. Show these to the human before answering.", [], []),
     ("respond_approval", "Answer one approval: allow_once, allow_always, or reject.", ["request_id", "option"], ["request_id", "option"]),
@@ -131,9 +133,9 @@ class Acp:
 class Session:
     def __init__(self, sid, cwd, title, agent):
         self.id, self.cwd, self.title, self.agent = sid, cwd, title, agent
-        self.messages, self.by_id, self.tools = [], {}, {}
+        self.messages, self.by_id, self.tools, self.events = [], {}, {}, []
         self.state, self.prompting, self.prompt_rid, self.pending = "idle", False, None, []
-        self.cv = threading.Condition()
+        self.turn_start, self.hub, self.cv = 0, None, threading.Condition()
 
     def add(self, role, text, mid):
         # Chunks with no messageId append to the open message of the same role
@@ -144,12 +146,24 @@ class Session:
         if not mid and self.messages and self.messages[-1].get("open") and self.messages[-1]["role"] == role:
             self.messages[-1]["text"] += text
             return
-        for msg in self.messages:
-            msg["open"] = False
+        self.close_assistant()
         msg = {"n": (self.messages[-1]["n"] + 1) if self.messages else 1, "role": role, "text": text, "open": not mid}
         self.messages.append(msg)
         if mid:
             self.by_id[mid] = msg
+
+    def close_assistant(self):
+        if not self.messages:
+            return
+        last = self.messages[-1]
+        if last["role"] != "assistant" or last.get("done"):
+            return
+        last["open"], last["done"] = False, True
+        snippet = " ".join(str(last["text"]).split())
+        if len(snippet) > 160:
+            snippet = snippet[:160] + "…"
+        if snippet and self.hub:
+            self.hub._event(self, "assistant " + snippet)
 
     def last_n(self):
         return self.messages[-1]["n"] if self.messages else 0
@@ -173,6 +187,7 @@ class Hub:
         if not sid:
             raise RuntimeError("session/new returned no sessionId")
         self.sessions[sid] = Session(sid, agent.cwd, title, agent)
+        self.sessions[sid].hub = self
         note = ""
         if mode:
             try:
@@ -187,6 +202,7 @@ class Hub:
             return f"session={got.id} cwd={got.cwd} state={got.state} last=#{got.last_n()}"
         agent = self.agent(cwd, "")
         self.sessions[session_id] = Session(session_id, agent.cwd, "", agent)
+        self.sessions[session_id].hub = self
         agent.request("session/load", {"sessionId": session_id, "cwd": agent.cwd, "mcpServers": []}, 60)
         return f"session={session_id} cwd={agent.cwd} state=idle last=#{self.sessions[session_id].last_n()}"
 
@@ -198,11 +214,13 @@ class Hub:
                 raise RuntimeError("session is already running")
             sess.add("user", text, f"user-{time.time_ns()}")
             sess.prompting, sess.state = True, "running"
-            start = sess.last_n()
+            start = sess.turn_start = sess.last_n()
         _rid, event, box = sess.agent.send(
             "session/prompt", {"sessionId": sess.id, "prompt": [{"type": "text", "text": text}]},
             before=lambda rid: setattr(sess, "prompt_rid", rid),
         )
+        if wait <= 0:
+            return "still running"
         deadline = time.time() + wait
         while True:
             with sess.cv:
@@ -216,6 +234,30 @@ class Hub:
         if "error" in box:
             raise RuntimeError(box["error"])
         return self._since(sess, start) or "(no assistant text)"
+
+    def wait(self, session_id, timeout_seconds=None):
+        """Block until idle, an unresolved approval, or timeout. 'still running' is not done."""
+        sess = self._sess(session_id)
+        deadline = time.time() + (1800.0 if timeout_seconds is None else float(timeout_seconds))
+        while True:
+            with sess.cv:
+                if sess.pending:
+                    return "state=waiting\n" + self._waiting(sess, sess.turn_start)
+                if not sess.prompting and sess.state != "running":
+                    text = self._since(sess, sess.turn_start)
+                    return "state=idle" + (f"\n{text}" if text else "")
+                if time.time() >= deadline:
+                    text = self._since(sess, sess.turn_start)
+                    return "state=running\nstill running" + (f"\n{text}" if text else "")
+                sess.cv.wait(0.2)
+
+    def events(self, session_id, since=None):
+        sess = self._sess(session_id)
+        floor = int(since) if since not in (None, "") else 0
+        lines = [f"#{e['n']} {e['line']}" for e in sess.events if e["n"] > floor]
+        last = sess.events[-1]["n"] if sess.events else 0
+        lines.append(f"last=#{last}")
+        return "\n".join(lines)
 
     def read(self, session_id, since=None):
         sess, floor = self._sess(session_id), int(since) if since not in (None, "") else 0
@@ -308,7 +350,17 @@ class Hub:
             elif kind == "user_message_chunk" and not sess.prompting:
                 sess.add("user", _text(update.get("content")), str(mid) if mid else None)
             elif kind == "tool_call":
+                sess.close_assistant()
                 self._remember_tool(sess, update)
+                tid = str(update.get("toolCallId") or update.get("tool_call_id") or "")
+                info = sess.tools.get(tid, {})
+                self._event(sess, f"tool {info.get('title') or 'tool'} {self._short(info.get('raw'))}".rstrip())
+            elif kind == "tool_call_update":
+                status = str(update.get("status") or "").lower()
+                if status in ("completed", "failed"):
+                    tid = str(update.get("toolCallId") or update.get("tool_call_id") or "")
+                    title = (sess.tools.get(tid) or {}).get("title") or tid or "tool"
+                    self._event(sess, f"tool_status {title} {status}")
             elif kind == "pending_interaction":
                 self._park_notice(sess, update)
             elif kind == "interaction_resolved":
@@ -343,6 +395,7 @@ class Hub:
         for sess in list(self.sessions.values()):
             if sess.agent is agent and sess.prompt_rid == request_id:
                 with sess.cv:
+                    sess.close_assistant()
                     sess.prompting, sess.prompt_rid = False, None
                     sess.state = "waiting" if sess.pending else "idle"
                     sess.cv.notify_all()
@@ -362,6 +415,18 @@ class Hub:
             self.agents.pop(path, None)
             raise
         return proc
+
+    def _event(self, sess, line):
+        n = sess.events[-1]["n"] + 1 if sess.events else 1
+        sess.events.append({"n": n, "line": line})
+
+    def _short(self, raw):
+        if isinstance(raw, dict):
+            for key in ("command", "cmd", "path"):
+                if raw.get(key):
+                    return str(raw[key])[:80]
+            raw = json.dumps(raw)
+        return str(raw or "")[:80]
 
     def _sess(self, session_id):
         sess = self.sessions.get(session_id)
@@ -393,6 +458,7 @@ class Hub:
         }
         sess.pending.append(public)
         sess.state = "waiting"
+        self._event(sess, f"approval {self.perms[public]['title']}")
 
     def _resolve_notice(self, sess, update):
         tid = str(update.get("tool_call_id") or update.get("toolCallId") or "")
@@ -401,6 +467,7 @@ class Hub:
                 perm["resolved"] = True
                 sess.pending = [item for item in sess.pending if item != perm["id"]]
                 sess.state = "running" if sess.prompting else "idle"
+                self._event(sess, f"approval_resolved {perm['title']}")
 
     def _drop(self, perm):
         self.perms.pop(perm["id"], None)
@@ -422,10 +489,11 @@ class Hub:
 
 
 def _schema(props, required):
-    return {"type": "object", "required": required, "properties": {n: {"type": "number" if n in ("wait_seconds", "since") else "string"} for n in props}}
+    nums = ("wait_seconds", "since", "timeout_seconds")
+    return {"type": "object", "required": required, "properties": {n: {"type": "number" if n in nums else "string"} for n in props}}
 
 
-def main():
+def _mcp():
     hub = Hub()
     for raw in sys.stdin.buffer:
         line = raw.strip()
@@ -458,6 +526,46 @@ def main():
                 payload = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(exc)}}
         sys.stdout.write(json.dumps(payload) + "\n")
         sys.stdout.flush()
+
+
+def _run(argv):
+    """Load a leader session, send one prompt, print the final text. --follow prints events as they happen."""
+    parser = argparse.ArgumentParser(prog="grok_mcp.py run")
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--cwd", required=True)
+    parser.add_argument("--text", required=True)
+    parser.add_argument("--follow", action="store_true")
+    parser.add_argument("--timeout", type=float, default=1800)
+    args = parser.parse_args(argv)
+    hub = Hub()
+    hub.load_session(args.session, args.cwd)
+    hub.prompt(args.session, args.text, wait_seconds=0)
+    sess, seen, deadline = hub._sess(args.session), 0, time.time() + args.timeout
+    while True:
+        with sess.cv:
+            fresh = [event for event in sess.events if event["n"] > seen]
+            idle = not sess.prompting and not sess.pending and sess.state != "running"
+            if not fresh and not idle and time.time() < deadline:
+                sess.cv.wait(0.2)
+                continue
+        for event in fresh:
+            if args.follow:
+                print(f"#{event['n']} {event['line']}", flush=True)
+            seen = event["n"]
+        if idle:
+            final = hub._since(sess, sess.turn_start)
+            if final:
+                print(final, flush=True)
+            return 0
+        if time.time() >= deadline:
+            print("still running", flush=True)
+            return 4
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        raise SystemExit(_run(sys.argv[2:]))
+    _mcp()
 
 
 if __name__ == "__main__":
