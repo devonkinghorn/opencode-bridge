@@ -96,6 +96,16 @@ To run one turn from the shell and print progress as it happens:
 python3 grok_mcp.py run --session <id> --cwd <dir> --text '...' --follow
 ```
 
+### herdr
+
+herdr (`hc`, [herdr.dev](https://herdr.dev)) runs Claude Code, Grok Build, Codex, or any terminal program in a persistent terminal you can watch and take over. The bridge drives it with `herdr_list`, `herdr_start`, `herdr_send`, `herdr_read`, `herdr_wait`, `herdr_interrupt`, and `herdr_keys`. `HC_BIN` overrides the binary; otherwise it uses `hc` on `PATH` or `~/.local/bin/hc`.
+
+```sh
+python3 grok_mcp.py herdr-run --terminal <t> --text '...' --follow --timeout 1800
+```
+
+`--follow` prints status changes and new screen lines (ANSI stripped) as they appear, then the screen tail. Exit 0 when the terminal is idle or done. A blocked permission dialog exits 3 and is not answered for you: approve it in the herdr app, `hc attach <t>` (Ctrl+\\ detaches), or an explicit `herdr_keys` call such as `down enter` for a trust prompt. `hc send --timeout` is a check-in; the bridge waits again until idle, done, blocked, error, or the overall timeout. If a send comes back `not_started`, it reads the screen once and retries once, then stops. Output is scraped from the screen, so it is incomplete while the agent is still working. Terminals are not restored after a reboot. A typed draft can hold a send for up to 60 seconds.
+
 ```sh
 python3 -m unittest tests.test_grok_mcp -v
 ```

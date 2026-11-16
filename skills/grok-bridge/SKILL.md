@@ -25,6 +25,17 @@ Never treat `still running` as the answer. Call `wait` or poll `read` until `sta
 
 A shell one-shot, if you are not inside the MCP client: `python3 grok_mcp.py run --session <id> --cwd <dir> --text '...' --follow`. It prints each event as it happens and the final assistant text, and exits 0 only when the turn is idle.
 
+## herdr
+
+Use the herdr tools when the user wants to watch the agent in a real terminal, or when the agent is Claude Code (it cannot take a message in an existing interactive session). `herdr_start` runs `claude`, `grok`, `codex`, or another command in a terminal that stays up after this server exits. The user watches it in the herdr app or with `hc attach <t>` (Ctrl+\\ detaches).
+
+- `herdr_send` waits out the whole turn. A timeout from `hc` is a check-in, not failure. `still running` means call `herdr_wait` or `herdr_send` again.
+- If the status is `blocked`, stop. Show the screen text. The human approves in herdr. Do not press keys unless they tell you the exact keys; then `herdr_keys`.
+- If a send is `not_started`, the text was not delivered. Read the screen. Do not paste the same task again in a loop.
+- Screen text is scraped and can be incomplete while the agent is working. Terminals are not brought back after a reboot. A half-typed draft can delay a send by up to 60 seconds.
+
+`python3 grok_mcp.py herdr-run --terminal <t> --text '...' --follow --timeout 1800` prints status changes and new screen lines, then the tail. Exit 0 only for idle or done.
+
 ## Approvals
 If `prompt` or `read` says `waiting for approval`, stop. Call `pending_approvals` and show the human the request id, tool title, and raw input.
 

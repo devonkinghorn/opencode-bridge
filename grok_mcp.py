@@ -12,7 +12,7 @@ The ext_method list has no x.ai/interaction or resolve_interaction. request_perm
 is still handled if a build sends it.
 """
 
-import argparse, json, os, shlex, subprocess, sys, threading, time
+import argparse, json, os, re, shlex, shutil, subprocess, sys, threading, time
 from pathlib import Path
 
 MODES = ("default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan")
@@ -27,6 +27,13 @@ TOOLS = [
     ("respond_approval", "Answer one approval: allow_once, allow_always, or reject.", ["request_id", "option"], ["request_id", "option"]),
     ("cancel", "Cancel the in-flight turn.", ["session_id"], ["session_id"]),
     ("list_sessions", "Sessions created or loaded in this process.", [], []),
+    ("herdr_list", "List live herdr terminals (hc ls).", [], []),
+    ("herdr_start", "Start claude, grok, codex, or a shell command in a herdr terminal. The first task is typed by hc run.", ["agent", "cwd", "name", "task"], ["agent", "cwd"]),
+    ("herdr_send", "Paste text into a herdr terminal and wait. timeout_seconds is the overall budget (default 1800); hc check-ins are not failure. Does not auto-approve a blocked dialog.", ["terminal", "text", "wait", "timeout_seconds", "force"], ["terminal", "text"]),
+    ("herdr_read", "Screen and history for a herdr terminal (ANSI stripped). Incomplete while it is working.", ["terminal", "lines"], ["terminal"]),
+    ("herdr_wait", "Wait until a herdr terminal is idle, done, blocked, or error, or timeout_seconds (default 1800).", ["terminal", "timeout_seconds"], ["terminal"]),
+    ("herdr_interrupt", "Send the stop key to a herdr terminal (hc interrupt).", ["terminal"], ["terminal"]),
+    ("herdr_keys", "Press named keys in a herdr terminal. Only after the human says which keys.", ["terminal", "keys"], ["terminal", "keys"]),
 ]
 
 
@@ -176,8 +183,12 @@ class Hub:
         self.perm_n, self.map = 0, threading.Lock()
 
     def call(self, name, args):
+        if name not in {t[0] for t in TOOLS}:
+            raise RuntimeError(f"unknown tool {name}")
+        if name.startswith("herdr_"):
+            return _herdr_tool(name, args or {})
         fn = getattr(self, name, None)
-        if name not in {t[0] for t in TOOLS} or not fn:
+        if not fn:
             raise RuntimeError(f"unknown tool {name}")
         return fn(**(args or {}))
 
@@ -511,6 +522,296 @@ class Hub:
         return "\n".join(bits + ([extra] if extra else []))
 
 
+_HC_STATES = ("idle", "working", "blocked", "error", "done")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _hc_bin():
+    override = os.environ.get("HC_BIN")
+    if override:
+        return override
+    found = shutil.which("hc")
+    if found:
+        return found
+    home = Path.home() / ".local" / "bin" / "hc"
+    return str(home) if home.is_file() else "hc"
+
+
+def _hc(args, timeout=None):
+    proc = subprocess.run(
+        [_hc_bin(), *args],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=None if timeout is None else timeout + 15,
+    )
+    out = proc.stdout or ""
+    data = None
+    raw = out.strip()
+    if raw.startswith("{") or raw.startswith("["):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = None
+    if proc.returncode != 0 and data is None:
+        raise RuntimeError((proc.stderr or out or f"hc exited {proc.returncode}").strip())
+    return data if data is not None else out
+
+
+def _hc_state(data):
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    if isinstance(status, dict):
+        state = status.get("state") or status.get("status")
+    elif isinstance(status, str):
+        state = status
+    else:
+        state = data.get("state") if data.get("state") in _HC_STATES else None
+    if state in _HC_STATES:
+        return state
+    for key in ("terminal", "record"):
+        if isinstance(data.get(key), dict):
+            found = _hc_state(data[key])
+            if found:
+                return found
+    return None
+
+
+def _hc_not_started(data):
+    if isinstance(data, dict):
+        if data.get("result") == "not_started" or data.get("phase") == "not_started":
+            return True
+        return "not_started" in json.dumps(data)
+    return "not_started" in str(data or "")
+
+
+def _hc_checkin(data, state):
+    if state in ("idle", "done", "blocked", "error"):
+        return False
+    if isinstance(data, dict) and (data.get("checked_in") or data.get("check_in") or data.get("timed_out")):
+        return True
+    return state in ("working", None)
+
+
+def _strip_ansi(text):
+    return _ANSI.sub("", text or "")
+
+
+def _hc_name(name):
+    cleaned = re.sub(r"[^a-z0-9_-]", "-", str(name or "agent").lower()).strip("-")[:32]
+    return cleaned or "agent"
+
+
+def _herdr_read_text(terminal, lines):
+    data = _hc(["read", str(terminal), "--lines", str(int(lines or 80))])
+    return _strip_ansi(data if isinstance(data, str) else json.dumps(data))
+
+
+def _herdr_status(terminal):
+    return _hc_state(_hc(["get", str(terminal), "--json"]))
+
+
+def _blocked_text(terminal, state):
+    screen = _herdr_read_text(terminal, 80)
+    return (
+        f"status={state} terminal={terminal}\n"
+        "The human should approve this in the herdr app, or say which keys to press. "
+        "Do not guess a permission dialog.\n"
+        + screen
+    )
+
+
+def herdr_list():
+    data = _hc(["ls", "--json"])
+    rows = data.get("terminals") if isinstance(data, dict) else data
+    if isinstance(data, dict) and rows is None:
+        rows = data.get("items") or []
+    if not isinstance(rows, list):
+        rows = []
+    if not rows:
+        return "no terminals"
+    lines = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        addr = row.get("address") or row.get("name") or "?"
+        lines.append(
+            f"{addr}\tname={row.get('name') or '-'}\tstatus={_hc_state(row) or '-'}\tcwd={row.get('cwd') or '-'}"
+        )
+    return "\n".join(lines) or "no terminals"
+
+
+def herdr_start(agent, cwd, name="", task=""):
+    known = {"claude": ["claude"], "grok": ["grok"], "codex": ["codex"]}
+    argv = list(known.get(agent, shlex.split(agent)))
+    if task:
+        argv.append(task)
+    if not argv:
+        raise RuntimeError("herdr_start needs an agent or command")
+    term_name = _hc_name(name or agent)
+    data = _hc([
+        "run", "--bg", "--json", "--outlive-parent", "--no-parent",
+        "--name", term_name, "--cwd", str(Path(cwd).expanduser().resolve()), *argv,
+    ])
+    if not isinstance(data, dict):
+        raise RuntimeError(f"hc run returned no JSON: {data}")
+    terminal = str(data.get("address") or data.get("name") or term_name)
+    first = data.get("first_message") if isinstance(data.get("first_message"), dict) else {}
+    sent = first.get("sent")
+    note = ""
+    if task and sent is False:
+        screen = _herdr_read_text(terminal, 40)
+        retry = _hc(["send", terminal, task, "--json"])
+        if _hc_not_started(retry):
+            note = f"\nfirst_message.sent=false; send was not_started. Read the screen before trying again.\n{screen}"
+        else:
+            note = "\nfirst_message.sent=false; retried once with hc send"
+    state = _hc_state(data) or _herdr_status(terminal) or "unknown"
+    if state == "blocked":
+        return _blocked_text(terminal, state) + note
+    return f"terminal={terminal} name={term_name} status={state} first_message.sent={sent}{note}"
+
+
+def herdr_send(terminal, text, wait=True, timeout_seconds=1800, force=False, on_checkin=None):
+    if isinstance(wait, str):
+        wait = wait.lower() not in ("0", "false", "no")
+    deadline = time.time() + float(1800 if timeout_seconds is None else timeout_seconds)
+    if not force and _herdr_status(terminal) == "blocked":
+        return _blocked_text(terminal, "blocked")
+    attempts = 0
+    delivered = False
+    while time.time() < deadline:
+        if on_checkin:
+            on_checkin()
+        remaining = max(1, int(deadline - time.time()))
+        if not delivered:
+            cmd = ["send", str(terminal), text, "--json"]
+            if force:
+                cmd.append("--force")
+            if wait:
+                cmd += ["--wait", "--timeout", str(min(180, remaining))]
+            data = _hc(cmd)
+            attempts += 1
+            if _hc_not_started(data):
+                screen = _herdr_read_text(terminal, 80)
+                if attempts >= 2:
+                    return f"status=not_started terminal={terminal}\nThe turn did not start. Not resending again.\n{screen}"
+                continue
+            delivered = True
+            if not wait:
+                state = _herdr_status(terminal) or "unknown"
+                return f"status={state} terminal={terminal}\n" + _herdr_read_text(terminal, 40)
+        else:
+            data = _hc(["wait", str(terminal), "--json", "--timeout", str(min(180, remaining))])
+        state = _hc_state(data) or _herdr_status(terminal)
+        if state == "blocked":
+            return _blocked_text(terminal, state)
+        if state == "error":
+            return f"status=error terminal={terminal}\n" + _herdr_read_text(terminal, 80)
+        if state in ("idle", "done"):
+            return f"status={state} terminal={terminal}\n" + _herdr_read_text(terminal, 80)
+        if not _hc_checkin(data, state):
+            return f"status={state or 'unknown'} terminal={terminal}\n" + _herdr_read_text(terminal, 40)
+    return f"status=working terminal={terminal}\nstill running\n" + _herdr_read_text(terminal, 40)
+
+
+def herdr_read(terminal, lines=80):
+    state = _herdr_status(terminal) or "unknown"
+    return f"status={state} terminal={terminal}\n" + _herdr_read_text(terminal, lines)
+
+
+def herdr_wait(terminal, timeout_seconds=1800):
+    return _herdr_wait_only(terminal, timeout_seconds)
+
+
+def _herdr_wait_only(terminal, timeout_seconds):
+    deadline = time.time() + float(1800 if timeout_seconds is None else timeout_seconds)
+    while time.time() < deadline:
+        remaining = max(1, int(deadline - time.time()))
+        data = _hc(["wait", str(terminal), "--json", "--timeout", str(min(180, remaining))])
+        state = _hc_state(data) or _herdr_status(terminal)
+        if state == "blocked":
+            return _blocked_text(terminal, state)
+        if state == "error":
+            return f"status=error terminal={terminal}\n" + _herdr_read_text(terminal, 80)
+        if state in ("idle", "done"):
+            return f"status={state} terminal={terminal}\n" + _herdr_read_text(terminal, 80)
+    return f"status=working terminal={terminal}\nstill running\n" + _herdr_read_text(terminal, 40)
+
+
+def herdr_interrupt(terminal):
+    data = _hc(["interrupt", str(terminal), "--json"])
+    return f"interrupted terminal={terminal} status={_hc_state(data) or _herdr_status(terminal) or 'unknown'}"
+
+
+def herdr_keys(terminal, keys):
+    names = keys if isinstance(keys, list) else shlex.split(str(keys))
+    if not names:
+        raise RuntimeError("herdr_keys needs key names")
+    _hc(["keys", str(terminal), *names, "--json"])
+    return f"keys {' '.join(names)} terminal={terminal}\n" + _herdr_read_text(terminal, 40)
+
+
+def _herdr_tool(name, args):
+    fn = {
+        "herdr_list": lambda: herdr_list(),
+        "herdr_start": lambda: herdr_start(args.get("agent") or "", args.get("cwd") or "", args.get("name") or "", args.get("task") or ""),
+        "herdr_send": lambda: herdr_send(args.get("terminal"), args.get("text") or "", args.get("wait", True), args.get("timeout_seconds", 1800), bool(args.get("force"))),
+        "herdr_read": lambda: herdr_read(args.get("terminal"), args.get("lines", 80)),
+        "herdr_wait": lambda: _herdr_wait_only(args.get("terminal"), args.get("timeout_seconds", 1800)),
+        "herdr_interrupt": lambda: herdr_interrupt(args.get("terminal")),
+        "herdr_keys": lambda: herdr_keys(args.get("terminal"), args.get("keys") or ""),
+    }.get(name)
+    if not fn:
+        raise RuntimeError(f"unknown tool {name}")
+    return fn()
+
+
+def _herdr_run(argv):
+    parser = argparse.ArgumentParser(prog="grok_mcp.py herdr-run")
+    parser.add_argument("--terminal", required=True)
+    parser.add_argument("--text", required=True)
+    parser.add_argument("--follow", action="store_true")
+    parser.add_argument("--timeout", type=float, default=1800)
+    args = parser.parse_args(argv)
+    deadline = time.time() + args.timeout
+    prev, last_status = [], None
+
+    def poll():
+        nonlocal last_status, prev
+        state = _herdr_status(args.terminal)
+        if args.follow and state and state != last_status:
+            print(f"status={state}", flush=True)
+            last_status = state
+        lines = _herdr_read_text(args.terminal, 200).splitlines()
+        index = 0
+        while index < len(prev) and index < len(lines) and prev[index] == lines[index]:
+            index += 1
+        if args.follow:
+            for line in lines[index:]:
+                print(line, flush=True)
+        prev[:] = lines
+        return state, lines
+
+    # Deliver once. A check-in or not_started is handled in herdr_send.
+    remaining = max(1, int(deadline - time.time()))
+    result = herdr_send(args.terminal, args.text, wait=True, timeout_seconds=remaining, on_checkin=poll)
+    state, lines = poll()
+    print("---", flush=True)
+    print("\n".join(lines[-40:]), flush=True)
+    if result.startswith("status=idle") or result.startswith("status=done") or state in ("idle", "done"):
+        return 0
+    if result.startswith("status=blocked") or state == "blocked":
+        print(result, flush=True)
+        return 3
+    if result.startswith("status=error") or state == "error":
+        print(result, flush=True)
+        return 1
+    print(result, flush=True)
+    return 4
+
+
 def _schema(props, required):
     nums = ("wait_seconds", "since", "timeout_seconds")
     return {"type": "object", "required": required, "properties": {n: {"type": "number" if n in nums else "string"} for n in props}}
@@ -589,6 +890,8 @@ def _run(argv):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "run":
         raise SystemExit(_run(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "herdr-run":
+        raise SystemExit(_herdr_run(sys.argv[2:]))
     _mcp()
 
 
