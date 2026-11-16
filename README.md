@@ -1,8 +1,11 @@
 # opencode-bridge
 
-A bridge that lets **Codex, Grok Bot, and other desktop AI tools do coding work through [opencode](https://opencode.ai)**. Another agent can start an opencode session, send it instructions, and read back what it said, without having to parse opencode's full JSON or spend tokens on tool calls and reasoning.
+Bridges that let **Codex, Grok Bot, and other desktop agents** drive a local coding CLI and read back only numbered user and assistant text.
 
-`opencode-bridge` is a single bash + jq script. It prints only user messages and assistant text, and numbers every message so the calling agent never skips anything, including messages you type into the opencode TUI yourself.
+- **[opencode](https://opencode.ai)** — `opencode-bridge`, a bash + jq script (below).
+- **[Grok Build](https://docs.x.ai/build)** (`grok`) — `grok_mcp.py`, a small MCP server that speaks ACP to `grok agent stdio` and parks tool approvals. See [Grok Build](#grok-build).
+
+`opencode-bridge` is a single bash + jq script. Another agent can start an opencode session, send it instructions, and read back what it said, without having to parse opencode's full JSON or spend tokens on tool calls and reasoning. It prints only user messages and assistant text, and numbers every message so the calling agent never skips anything, including messages you type into the opencode TUI yourself.
 
 Example output (illustrative):
 
@@ -63,6 +66,41 @@ Every call ends with `last=#N`. Pass that back as `--since N` next time, and you
 ## How it works
 
 It reads `opencode session export <id>` and numbers messages by their position, and it sends with `opencode run` (`--session` to continue, `--agent` for the mode). Background runs are detached with `setsid nohup`, and their output goes to a temp log. It was written against opencode v2.2.0's export format. If a later version changes that format, adjust the jq filter.
+
+## Grok Build
+
+`grok_mcp.py` is one Python 3 file (stdlib only). It is an MCP server on stdio. It spawns one `grok agent stdio` process per project directory and turns MCP tool calls into ACP. Streamed text chunks are joined into numbered user and assistant messages.
+
+For a turn to show up live in the Grok TUI, start the TUI with `grok --leader` (or set `[cli] use_leader = true` in `~/.grok/config.toml`). The server then spawns `grok --no-auto-update agent --leader stdio`, which attaches to `~/.grok/leader.sock`. `GROK_LEADER=0` uses `--no-leader` instead. `GROK_LEADER_SOCKET` is passed as `--leader-socket`.
+
+Register it in Cursor (or any MCP client) as:
+
+```json
+{
+  "mcpServers": {
+    "grok": {
+      "command": "python3",
+      "args": ["/absolute/path/to/grok_mcp.py"]
+    }
+  }
+}
+```
+
+`grok` should be on `PATH`, or set `GROK_BIN` to `~/.grok/bin/grok`. Run `grok login` once. Needs Python 3.9+.
+
+Tools: `new_session`, `load_session`, `prompt`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` returns the assistant text, or a line that starts with `still running` or `waiting for approval`. On grok 1.0.84 the approval is answered in that TUI, not by `respond_approval`. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
+
+```sh
+python3 -m unittest tests.test_grok_mcp -v
+```
+
+Checked against a live grok 1.0.84 client (leader reported 1.0.87) on a Mac:
+
+- `grok --no-auto-update agent --leader stdio` plus a TUI opened with `grok --leader` shows `session/load` + `session/prompt` live in the TUI. `~/.grok/leader.sock` comes up with the leader. `[cli] use_leader = true` enables the same sharing.
+- The client received no inbound JSON-RPC requests. Approvals arrive as `session/update` notifications: `tool_call` (title, rawInput), then `pending_interaction` (`tool_call_id`, `kind: "permission"`), then `interaction_resolved` (`tool_call_id`) when the TUI answers. `pending_approvals` and `read` show the title and raw input, and mark the row resolved.
+- The agent's `ext_method` list (current grok-build source) has no `x.ai/interaction` or `resolve_interaction`. `respond_approval` still answers a real `session/request_permission` if one arrives. A `pending_interaction` has to be approved in the TUI.
+- Assistant text often has no `messageId` and is one word per chunk. Those chunks append to the open assistant message.
+- `session/set_mode` is still best-effort. Auth uses `xai.api_key` when `XAI_API_KEY` is set, else `cached_token`. `grok.com` login is not automated.
 
 ## License
 
