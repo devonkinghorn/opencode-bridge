@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """MCP stdio server for Grok Build via ACP (`grok agent stdio`).
 
-One grok process per cwd, in memory. session/request_permission is parked
-until respond_approval. Fs/terminal capabilities are off so Grok uses its
-own tools. Stdout is MCP JSON-RPC only.
+One grok process per cwd. Default spawn is `grok --no-auto-update agent --leader stdio`
+so a TUI started with `grok --leader` shows the same turn. GROK_LEADER=0 uses
+--no-leader. GROK_LEADER_SOCKET is passed as --leader-socket. GROK_BRIDGE_AGENT
+replaces the argv (tests).
 
-Not executed against grok 1.0.84 here. Assumes ACP protocolVersion 1 and
-session/new, session/load, session/prompt, session/cancel, request_permission.
-GROK_BRIDGE_AGENT replaces the grok argv (tests). Flag order (--permission-mode
-before `agent`, --no-leader before `stdio`) follows Grok's docs, unverified here.
+Observed on grok 1.0.84: no inbound session/request_permission. Approvals are
+session/update pending_interaction / interaction_resolved, answered in the TUI.
+The ext_method list has no x.ai/interaction or resolve_interaction. request_permission
+is still handled if a build sends it.
 """
 
 import json, os, shlex, subprocess, sys, threading, time
@@ -44,7 +45,12 @@ def _argv(mode):
     if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
         binary = "grok"
     chosen = mode if mode in MODES else "default"
-    return [binary, "--no-auto-update", "--permission-mode", chosen, "agent", "--no-leader", "stdio"]
+    leader = os.environ.get("GROK_LEADER", "1") != "0"
+    argv = [binary, "--no-auto-update", "--permission-mode", chosen, "agent", "--leader" if leader else "--no-leader", "stdio"]
+    sock = os.environ.get("GROK_LEADER_SOCKET")
+    if leader and sock:
+        argv.extend(["--leader-socket", sock])
+    return argv
 
 
 class Acp:
@@ -125,15 +131,22 @@ class Acp:
 class Session:
     def __init__(self, sid, cwd, title, agent):
         self.id, self.cwd, self.title, self.agent = sid, cwd, title, agent
-        self.messages, self.by_id = [], {}
+        self.messages, self.by_id, self.tools = [], {}, {}
         self.state, self.prompting, self.prompt_rid, self.pending = "idle", False, None, []
         self.cv = threading.Condition()
 
     def add(self, role, text, mid):
+        # Chunks with no messageId append to the open message of the same role
+        # (grok 1.0.84 streams one word per agent_message_chunk).
         if mid and mid in self.by_id:
             self.by_id[mid]["text"] += text
             return
-        msg = {"n": (self.messages[-1]["n"] + 1) if self.messages else 1, "role": role, "text": text}
+        if not mid and self.messages and self.messages[-1].get("open") and self.messages[-1]["role"] == role:
+            self.messages[-1]["text"] += text
+            return
+        for msg in self.messages:
+            msg["open"] = False
+        msg = {"n": (self.messages[-1]["n"] + 1) if self.messages else 1, "role": role, "text": text, "open": not mid}
         self.messages.append(msg)
         if mid:
             self.by_id[mid] = msg
@@ -207,24 +220,44 @@ class Hub:
     def read(self, session_id, since=None):
         sess, floor = self._sess(session_id), int(since) if since not in (None, "") else 0
         lines = [f"#{m['n']} [{m['role']}]\n{m['text'].strip()}" for m in sess.messages if m["n"] > floor and str(m["text"]).strip()]
-        if sess.pending:
-            lines.append(self._waiting(sess, 0).split("\n")[0])
+        for perm in self.perms.values():
+            if perm["session"] != sess.id:
+                continue
+            if perm.get("resolved"):
+                lines.append(f"approval resolved: {perm['id']} {perm['title']}")
+            elif perm["id"] in sess.pending:
+                lines.append(f"waiting for approval: {perm['id']} {perm['title']}")
         lines.append(f"last=#{sess.last_n()} session={sess.id}")
         return "\n".join(lines)
 
     def pending_approvals(self):
         if not self.perms:
             return "no pending approvals"
-        return "\n".join(
-            f"{p['id']} session={p['session']} tool={p['tool'] or '-'} kind={p['kind'] or '-'} title={p['title'] or '-'}\n  options: "
-            + (", ".join(f"{o.get('kind')}={o.get('optionId')}" for o in p["options"]) or "-")
-            for p in self.perms.values()
-        )
+        blocks = []
+        for perm in self.perms.values():
+            opts = ", ".join(f"{o.get('kind')}={o.get('optionId')}" for o in perm["options"]) or "-"
+            raw = perm.get("raw")
+            raw_s = raw if isinstance(raw, str) else (json.dumps(raw) if raw is not None else "-")
+            if len(raw_s) > 300:
+                raw_s = raw_s[:300] + "…"
+            state = "resolved" if perm.get("resolved") else "pending"
+            blocks.append(
+                f"{perm['id']} status={state} session={perm['session']} tool={perm['tool'] or '-'} "
+                f"kind={perm['kind'] or '-'} title={perm['title'] or '-'}\n  raw: {raw_s}\n  options: {opts}"
+            )
+        return "\n".join(blocks)
 
     def respond_approval(self, request_id, option):
         perm = self.perms.get(request_id)
         if not perm:
             raise RuntimeError(f"no pending approval {request_id}")
+        if perm.get("resolved"):
+            return f"{request_id} already resolved"
+        if not perm.get("rpc"):
+            return (
+                f"{request_id} ({perm['title']}) is answered in the grok --leader TUI. "
+                "No x.ai/interaction or resolve_interaction method is in the agent ext_method list."
+            )
         kind = {"allow_once": "allow_once", "allow_always": "allow_always", "reject": "reject_once"}.get(option)
         if not kind:
             raise RuntimeError("option must be allow_once, allow_always, or reject")
@@ -249,7 +282,8 @@ class Hub:
             perm = self.perms.get(pid)
             if perm:
                 self._drop(perm)
-                perm["agent"].write({"jsonrpc": "2.0", "id": perm["rpc"], "result": {"outcome": {"outcome": "cancelled"}}})
+                if perm.get("rpc") is not None:
+                    perm["agent"].write({"jsonrpc": "2.0", "id": perm["rpc"], "result": {"outcome": {"outcome": "cancelled"}}})
         with sess.cv:
             sess.prompting, sess.state = False, "idle"
             sess.cv.notify_all()
@@ -273,6 +307,12 @@ class Hub:
                 sess.add("assistant", _text(update.get("content")), str(mid) if mid else None)
             elif kind == "user_message_chunk" and not sess.prompting:
                 sess.add("user", _text(update.get("content")), str(mid) if mid else None)
+            elif kind == "tool_call":
+                self._remember_tool(sess, update)
+            elif kind == "pending_interaction":
+                self._park_notice(sess, update)
+            elif kind == "interaction_resolved":
+                self._resolve_notice(sess, update)
             sess.cv.notify_all()
 
     def on_request(self, agent, msg):
@@ -289,7 +329,7 @@ class Hub:
             "id": public, "rpc": msg.get("id"), "session": str(params.get("sessionId") or ""), "agent": agent,
             "tool": name, "kind": str((tool.get("kind") if isinstance(tool, dict) else "") or meta.get("kind") or ""),
             "title": str((tool.get("title") if isinstance(tool, dict) else "") or name or "tool"),
-            "options": [o for o in (params.get("options") or []) if isinstance(o, dict)],
+            "raw": raw, "options": [o for o in (params.get("options") or []) if isinstance(o, dict)],
         }
         self.perms[public] = perm
         sess = self.sessions.get(perm["session"])
@@ -328,6 +368,39 @@ class Hub:
         if not sess:
             raise RuntimeError(f"no session {session_id}")
         return sess
+
+    def _remember_tool(self, sess, update):
+        tid = str(update.get("toolCallId") or update.get("tool_call_id") or "")
+        meta = ((update.get("_meta") or {}).get("x.ai/tool") or {}) if isinstance(update.get("_meta"), dict) else {}
+        sess.tools[tid] = {
+            "title": str(update.get("title") or ""),
+            "raw": update.get("rawInput") if "rawInput" in update else update.get("raw_input"),
+            "name": str(meta.get("name") or ""),
+            "kind": str(update.get("kind") or meta.get("kind") or ""),
+        }
+
+    def _park_notice(self, sess, update):
+        tid = str(update.get("tool_call_id") or update.get("toolCallId") or "")
+        info = sess.tools.get(tid, {})
+        if any(p.get("tool_call_id") == tid and not p.get("resolved") for p in self.perms.values()):
+            return
+        self.perm_n += 1
+        public = f"req-{self.perm_n}"
+        self.perms[public] = {
+            "id": public, "rpc": None, "session": sess.id, "agent": sess.agent, "tool_call_id": tid,
+            "tool": info.get("name") or "", "kind": str(update.get("kind") or "permission"),
+            "title": info.get("title") or tid or "tool", "raw": info.get("raw"), "options": [],
+        }
+        sess.pending.append(public)
+        sess.state = "waiting"
+
+    def _resolve_notice(self, sess, update):
+        tid = str(update.get("tool_call_id") or update.get("toolCallId") or "")
+        for perm in self.perms.values():
+            if perm.get("session") == sess.id and perm.get("tool_call_id") == tid and not perm.get("resolved"):
+                perm["resolved"] = True
+                sess.pending = [item for item in sess.pending if item != perm["id"]]
+                sess.state = "running" if sess.prompting else "idle"
 
     def _drop(self, perm):
         self.perms.pop(perm["id"], None)

@@ -4,6 +4,7 @@
 import json
 import sys
 import threading
+import time
 import uuid
 
 write_lock = threading.Lock()
@@ -33,6 +34,26 @@ def handle(msg):
     elif method == "session/prompt":
         sid = params.get("sessionId")
         text = "".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
+        if "INTERACT" in text:
+            for piece in ("Hel", "lo"):
+                emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": piece}}}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-9", "title": "Edit src/y.ts", "kind": "edit",
+                "rawInput": {"path": "src/y.ts"},
+            }}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "pending_interaction", "tool_call_id": "call-9", "kind": "permission",
+            }}})
+
+            def resolve_later():
+                time.sleep(0.8)
+                emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                    "sessionUpdate": "interaction_resolved", "tool_call_id": "call-9",
+                }}})
+
+            threading.Thread(target=resolve_later, daemon=True).start()
+            threading.Event().wait()
+            return
         if "BLOCK" not in text:
             emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "messageId": "p1", "content": {"type": "text", "text": "plain reply"}}}})
             emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})

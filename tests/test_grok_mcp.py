@@ -5,10 +5,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 FAKE = ROOT / "tests" / "fake_acp_agent.py"
 
 
@@ -66,6 +68,89 @@ class McpTests(unittest.TestCase):
             self.assertIn("Working.", seen)
             self.assertIn("decision:allow-once", seen)
             self.assertIn(sid, tool("list_sessions", {}))
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+            proc.stdin.close()
+            proc.stdout.close()
+
+    def test_pending_interaction_and_leader_flag(self):
+        import grok_mcp
+
+        saved = {key: os.environ.get(key) for key in ("GROK_BRIDGE_AGENT", "GROK_BIN", "GROK_LEADER", "GROK_LEADER_SOCKET")}
+        try:
+            os.environ.pop("GROK_BRIDGE_AGENT", None)
+            os.environ["GROK_BIN"] = "grok"
+            os.environ.pop("GROK_LEADER", None)
+            os.environ.pop("GROK_LEADER_SOCKET", None)
+            argv = grok_mcp._argv("plan")
+            self.assertIn("--leader", argv)
+            self.assertNotIn("--no-leader", argv)
+            os.environ["GROK_LEADER"] = "0"
+            self.assertIn("--no-leader", grok_mcp._argv("plan"))
+            os.environ["GROK_LEADER"] = "1"
+            os.environ["GROK_LEADER_SOCKET"] = "/tmp/leader.sock"
+            flagged = grok_mcp._argv("default")
+            self.assertEqual(flagged[flagged.index("--leader-socket") + 1], "/tmp/leader.sock")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        project = tempfile.mkdtemp()
+        env = os.environ.copy()
+        env["GROK_BRIDGE_AGENT"] = f"{sys.executable} {FAKE}"
+        proc = subprocess.Popen(
+            [sys.executable, "-u", str(ROOT / "grok_mcp.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            cwd=project,
+        )
+        seq = 0
+
+        def rpc(method, params=None):
+            nonlocal seq
+            seq += 1
+            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": seq, "method": method, "params": params or {}}) + "\n").encode())
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline())
+
+        def tool(name, arguments):
+            msg = rpc("tools/call", {"name": name, "arguments": arguments})
+            text = msg["result"]["content"][0]["text"]
+            self.assertFalse(msg["result"].get("isError"), text)
+            return text
+
+        try:
+            rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}})
+            created = tool("new_session", {"cwd": project})
+            sid = created.split("session=", 1)[1].split()[0]
+            blocked = tool("prompt", {"session_id": sid, "text": "INTERACT now", "wait_seconds": 5})
+            self.assertIn("waiting for approval:", blocked)
+            self.assertIn("Edit src/y.ts", blocked)
+            pending = tool("pending_approvals", {})
+            self.assertIn("status=pending", pending)
+            self.assertIn("src/y.ts", pending)
+            self.assertIn("Edit src/y.ts", pending)
+            req = pending.split()[0]
+            answer = tool("respond_approval", {"request_id": req, "option": "allow_once"})
+            self.assertIn("TUI", answer)
+            seen = tool("read", {"session_id": sid})
+            self.assertIn("Hello", seen)
+            self.assertEqual(seen.count("[assistant]"), 1)
+            self.assertIn(f"waiting for approval: {req} Edit src/y.ts", seen)
+            resolved = ""
+            for _ in range(30):
+                resolved = tool("read", {"session_id": sid})
+                if "approval resolved:" in resolved:
+                    break
+                time.sleep(0.1)
+            self.assertIn(f"approval resolved: {req} Edit src/y.ts", resolved)
+            self.assertIn("status=resolved", tool("pending_approvals", {}))
         finally:
             proc.kill()
             proc.wait(timeout=5)

@@ -4,7 +4,9 @@ description: Use the grok-mcp MCP server to run coding work in a local Grok Buil
 ---
 # Grok Build via the grok-bridge MCP server
 
-The server is `grok_mcp.py`. It speaks MCP on stdio and keeps one `grok agent stdio` process per project directory. Tools:
+The server is `grok_mcp.py`. It speaks MCP on stdio and keeps one `grok agent stdio` process per project directory. For the turn to appear live in the user's terminal, they start Grok with `grok --leader`, or set `[cli] use_leader = true` in `~/.grok/config.toml`. The server attaches to that leader (`~/.grok/leader.sock`).
+
+Tools:
 
 - `new_session(cwd, title?, mode?)` — mode is `plan`, `default`, or `acceptEdits`
 - `load_session(session_id, cwd)` — resume, including a TUI session when Grok allows `session/load`
@@ -18,6 +20,8 @@ The server is `grok_mcp.py`. It speaks MCP on stdio and keeps one `grok agent st
 Save `last=#N` and pass it as `since` next time.
 
 ## Approvals
-If `prompt` or `read` says `waiting for approval`, stop. Call `pending_approvals` and show the human the request id, tool, title, kind, and options. Call `respond_approval` only after they clearly accept or refuse that action. Use `allow_always` only if they said to remember it. A later tool is a new request; ask again.
+If `prompt` or `read` says `waiting for approval`, stop. Call `pending_approvals` and show the human the request id, tool title, and raw input.
 
-Do not pass `bypassPermissions` unless they asked. `plan` is for designing, not editing.
+On grok 1.0.84 that approval is answered in the `grok --leader` TUI. `respond_approval` will say so. Do not invent a click in the TUI. Tell the human which tool is waiting and let them allow or reject it there. `read` again after `approval resolved`.
+
+`respond_approval(request_id, option)` is only for a real `session/request_permission` (`allow_once`, `allow_always`, or `reject`). Use `allow_always` only if they said to remember it. Do not pass `bypassPermissions` unless they asked. `plan` is for designing, not editing.

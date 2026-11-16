@@ -69,7 +69,9 @@ It reads `opencode session export <id>` and numbers messages by their position, 
 
 ## Grok Build
 
-`grok_mcp.py` is one Python 3 file (stdlib only). It is an MCP server on stdio. It spawns `grok agent stdio` (one process per project directory, kept in memory) and turns MCP tool calls into ACP. Streamed text chunks are joined into numbered user and assistant messages. `session/request_permission` is parked until a tool answers it. The server does not approve tools by itself.
+`grok_mcp.py` is one Python 3 file (stdlib only). It is an MCP server on stdio. It spawns one `grok agent stdio` process per project directory and turns MCP tool calls into ACP. Streamed text chunks are joined into numbered user and assistant messages.
+
+For a turn to show up live in the Grok TUI, start the TUI with `grok --leader` (or set `[cli] use_leader = true` in `~/.grok/config.toml`). The server then spawns `grok --no-auto-update agent --leader stdio`, which attaches to `~/.grok/leader.sock`. `GROK_LEADER=0` uses `--no-leader` instead. `GROK_LEADER_SOCKET` is passed as `--leader-socket`.
 
 Register it in Cursor (or any MCP client) as:
 
@@ -86,13 +88,19 @@ Register it in Cursor (or any MCP client) as:
 
 `grok` should be on `PATH`, or set `GROK_BIN` to `~/.grok/bin/grok`. Run `grok login` once. Needs Python 3.9+.
 
-Tools: `new_session`, `load_session`, `prompt`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` returns the assistant text, or a line that starts with `still running` or `waiting for approval`. `respond_approval` takes `allow_once`, `allow_always`, or `reject`. Show a pending approval to the person and answer only after they say so. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
+Tools: `new_session`, `load_session`, `prompt`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` returns the assistant text, or a line that starts with `still running` or `waiting for approval`. On grok 1.0.84 the approval is answered in that TUI, not by `respond_approval`. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
 
 ```sh
 python3 -m unittest tests.test_grok_mcp -v
 ```
 
-This was not run against grok 1.0.84 (no binary here). It assumes ACP `initialize` / `session/new` / `session/load` / `session/prompt` / `session/cancel`, and that declining fs and terminal capabilities makes Grok emit `session/request_permission` instead of auto-approving. An older unofficial trace (v0.2.112) did not see that method. `session/set_mode` is attempted for `mode` and ignored if the agent rejects it. Auth uses `xai.api_key` when `XAI_API_KEY` is set, else `cached_token`. `grok.com` login is not automated.
+Checked against a live grok 1.0.84 client (leader reported 1.0.87) on a Mac:
+
+- `grok --no-auto-update agent --leader stdio` plus a TUI opened with `grok --leader` shows `session/load` + `session/prompt` live in the TUI. `~/.grok/leader.sock` comes up with the leader. `[cli] use_leader = true` enables the same sharing.
+- The client received no inbound JSON-RPC requests. Approvals arrive as `session/update` notifications: `tool_call` (title, rawInput), then `pending_interaction` (`tool_call_id`, `kind: "permission"`), then `interaction_resolved` (`tool_call_id`) when the TUI answers. `pending_approvals` and `read` show the title and raw input, and mark the row resolved.
+- The agent's `ext_method` list (current grok-build source) has no `x.ai/interaction` or `resolve_interaction`. `respond_approval` still answers a real `session/request_permission` if one arrives. A `pending_interaction` has to be approved in the TUI.
+- Assistant text often has no `messageId` and is one word per chunk. Those chunks append to the open assistant message.
+- `session/set_mode` is still best-effort. Auth uses `xai.api_key` when `XAI_API_KEY` is set, else `cached_token`. `grok.com` login is not automated.
 
 ## License
 
