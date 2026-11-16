@@ -88,7 +88,23 @@ Register it in Cursor (or any MCP client) as:
 
 `grok` should be on `PATH`, or set `GROK_BIN` to `~/.grok/bin/grok`. Run `grok login` once. Needs Python 3.9+.
 
-Tools: `new_session`, `load_session`, `prompt`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` returns the assistant text, or a line that starts with `still running` or `waiting for approval`. On grok 1.0.84 the approval is answered in that TUI, not by `respond_approval`. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
+Tools: `new_session`, `load_session`, `prompt`, `wait`, `events`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` with `wait_seconds=0` returns `still running` immediately. That is not finished. Call `wait` (default 30 minutes) or poll `read` until `state=idle`. `wait` also returns when an approval is unresolved (`state=waiting`) or the timeout hits (`state=running` / `still running`). `events` is a numbered one-line feed (`tool`, `tool_status`, `approval`, `assistant`) with `last=#N`. After a prompt, `events` and `run --follow` start at that prompt and skip the `session/load` replay. Tool arguments in those lines are one line, cut at 120 characters. On grok 1.0.84 an approval is answered in the TUI, not by `respond_approval`. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
+
+To run one turn from the shell and print progress as it happens:
+
+```sh
+python3 grok_mcp.py run --session <id> --cwd <dir> --text '...' --follow
+```
+
+### herdr
+
+herdr (`hc`, [herdr.dev](https://herdr.dev)) runs Claude Code, Grok Build, Codex, or any terminal program in a persistent terminal you can watch and take over. The bridge drives it with `herdr_list`, `herdr_start`, `herdr_send`, `herdr_read`, `herdr_wait`, `herdr_interrupt`, and `herdr_keys`. `HC_BIN` overrides the binary; otherwise it uses `hc` on `PATH` or `~/.local/bin/hc`.
+
+```sh
+python3 grok_mcp.py herdr-run --terminal <t> --text '...' --follow --timeout 1800
+```
+
+`--follow` prints status changes and new screen lines (ANSI stripped) as they appear, then the screen tail. Exit 0 when the terminal is idle or done. A blocked permission dialog exits 3 and is not answered for you: approve it in the herdr app, `hc attach <t>` (Ctrl+\\ detaches), or an explicit `herdr_keys` call such as `down enter` for a trust prompt. `hc send --timeout` is a check-in; the bridge waits again until idle, done, blocked, error, or the overall timeout. If a send comes back `not_started`, it reads the screen once and retries once, then stops. Output is scraped from the screen, so it is incomplete while the agent is still working. Terminals are not restored after a reboot. A typed draft can hold a send for up to 60 seconds.
 
 ```sh
 python3 -m unittest tests.test_grok_mcp -v

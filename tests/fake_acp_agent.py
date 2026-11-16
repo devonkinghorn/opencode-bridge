@@ -27,13 +27,40 @@ def handle(msg):
         emit({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": str(uuid.uuid4())}})
     elif method == "session/load":
         sid = params.get("sessionId")
-        emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "messageId": "load-1", "content": {"type": "text", "text": "loaded"}}}})
+        emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "messageId": "load-1", "content": {"type": "text", "text": "replayed history"}}}})
+        emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "old-1", "title": "Old command",
+            "rawInput": {"command": "echo replay-should-skip\nline-two\n" + ("Y" * 300)},
+        }}})
         emit({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif method == "session/set_mode":
         emit({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif method == "session/prompt":
         sid = params.get("sessionId")
         text = "".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
+        if "FLOW" in text:
+            for piece in ("Hi", " there"):
+                emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": piece}}}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-3", "title": "Run tests", "kind": "execute",
+                "rawInput": {"command": "pytest -q\n--tb=short\n" + ("Z" * 200)},
+            }}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "call-3", "status": "completed",
+            }}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "All done"}}}})
+            emit({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+            return
+        if "HOLD" in text:
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-4", "title": "Edit src/z.ts", "kind": "edit",
+                "rawInput": {"path": "src/z.ts"},
+            }}})
+            emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "pending_interaction", "tool_call_id": "call-4", "kind": "permission",
+            }}})
+            threading.Event().wait()
+            return
         if "INTERACT" in text:
             for piece in ("Hel", "lo"):
                 emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": piece}}}})
