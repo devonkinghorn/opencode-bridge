@@ -1,8 +1,11 @@
 # opencode-bridge
 
-A bridge that lets **Codex, Grok Bot, and other desktop AI tools do coding work through [opencode](https://opencode.ai)**. Another agent can start an opencode session, send it instructions, and read back what it said, without having to parse opencode's full JSON or spend tokens on tool calls and reasoning.
+Bridges that let **Codex, Grok Bot, and other desktop agents** drive a local coding CLI and read back only numbered user and assistant text.
 
-`opencode-bridge` is a single bash + jq script. It prints only user messages and assistant text, and numbers every message so the calling agent never skips anything, including messages you type into the opencode TUI yourself.
+- **[opencode](https://opencode.ai)** — `opencode-bridge`, a bash + jq script (below).
+- **[Grok Build](https://docs.x.ai/build)** (`grok`) — `grok_mcp.py`, a small MCP server that speaks ACP to `grok agent stdio` and parks tool approvals. See [Grok Build](#grok-build).
+
+`opencode-bridge` is a single bash + jq script. Another agent can start an opencode session, send it instructions, and read back what it said, without having to parse opencode's full JSON or spend tokens on tool calls and reasoning. It prints only user messages and assistant text, and numbers every message so the calling agent never skips anything, including messages you type into the opencode TUI yourself.
 
 Example output (illustrative):
 
@@ -63,6 +66,33 @@ Every call ends with `last=#N`. Pass that back as `--since N` next time, and you
 ## How it works
 
 It reads `opencode session export <id>` and numbers messages by their position, and it sends with `opencode run` (`--session` to continue, `--agent` for the mode). Background runs are detached with `setsid nohup`, and their output goes to a temp log. It was written against opencode v2.2.0's export format. If a later version changes that format, adjust the jq filter.
+
+## Grok Build
+
+`grok_mcp.py` is one Python 3 file (stdlib only). It is an MCP server on stdio. It spawns `grok agent stdio` (one process per project directory, kept in memory) and turns MCP tool calls into ACP. Streamed text chunks are joined into numbered user and assistant messages. `session/request_permission` is parked until a tool answers it. The server does not approve tools by itself.
+
+Register it in Cursor (or any MCP client) as:
+
+```json
+{
+  "mcpServers": {
+    "grok": {
+      "command": "python3",
+      "args": ["/absolute/path/to/grok_mcp.py"]
+    }
+  }
+}
+```
+
+`grok` should be on `PATH`, or set `GROK_BIN` to `~/.grok/bin/grok`. Run `grok login` once. Needs Python 3.9+.
+
+Tools: `new_session`, `load_session`, `prompt`, `read`, `pending_approvals`, `respond_approval`, `cancel`, `list_sessions`. `prompt` returns the assistant text, or a line that starts with `still running` or `waiting for approval`. `respond_approval` takes `allow_once`, `allow_always`, or `reject`. Show a pending approval to the person and answer only after they say so. [`skills/grok-bridge/SKILL.md`](skills/grok-bridge/SKILL.md) is the short skill for a calling agent.
+
+```sh
+python3 -m unittest tests.test_grok_mcp -v
+```
+
+This was not run against grok 1.0.84 (no binary here). It assumes ACP `initialize` / `session/new` / `session/load` / `session/prompt` / `session/cancel`, and that declining fs and terminal capabilities makes Grok emit `session/request_permission` instead of auto-approving. An older unofficial trace (v0.2.112) did not see that method. `session/set_mode` is attempted for `mode` and ignored if the agent rejects it. Auth uses `xai.api_key` when `XAI_API_KEY` is set, else `cached_token`. `grok.com` login is not automated.
 
 ## License
 
