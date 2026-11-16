@@ -201,6 +201,19 @@ class McpTests(unittest.TestCase):
             self.assertIn("assistant Hi there", ev)
             last = int(ev.strip().split("last=#", 1)[1])
             self.assertTrue(tool("events", {"session_id": fid, "since": last}).startswith("last=#"))
+            tool("load_session", {"session_id": "replay-sess", "cwd": project})
+            self.assertTrue(tool("prompt", {"session_id": "replay-sess", "text": "FLOW please", "wait_seconds": 0}).startswith("still running"))
+            replayed = tool("wait", {"session_id": "replay-sess", "timeout_seconds": 10})
+            self.assertIn("state=idle", replayed)
+            self.assertNotIn("replay-should-skip", replayed)
+            self.assertNotIn("replayed history", replayed)
+            skipped = tool("events", {"session_id": "replay-sess"})
+            self.assertNotIn("replay-should-skip", skipped)
+            self.assertNotIn("replayed history", skipped)
+            self.assertIn("pytest -q", skipped)
+            tool_line = next(line for line in skipped.splitlines() if "pytest -q" in line)
+            self.assertLessEqual(len(tool_line.split("Run tests ", 1)[1]), 120)
+            self.assertNotIn("Z" * 121, tool_line)
         finally:
             proc.kill()
             proc.wait(timeout=5)
@@ -214,6 +227,10 @@ class McpTests(unittest.TestCase):
         self.assertEqual(cli.returncode, 0, cli.stdout + cli.stderr)
         self.assertIn("pytest -q", cli.stdout)
         self.assertIn("All done", cli.stdout)
+        self.assertNotIn("replay-should-skip", cli.stdout)
+        self.assertNotIn("replayed history", cli.stdout)
+        follow_line = next(line for line in cli.stdout.splitlines() if "pytest -q" in line)
+        self.assertLessEqual(len(follow_line.split("Run tests ", 1)[1]), 120)
 
 
 if __name__ == "__main__":

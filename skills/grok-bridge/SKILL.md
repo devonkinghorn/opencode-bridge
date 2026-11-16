@@ -12,7 +12,7 @@ Tools:
 - `load_session(session_id, cwd)` — resume, including a TUI session when Grok allows `session/load`
 - `prompt(session_id, text, wait_seconds?)` — pass `wait_seconds: 0` on a long turn. The reply `still running` means the turn has not finished
 - `wait(session_id, timeout_seconds?)` — block until `state=idle`, `state=waiting` (unresolved approval), or `state=running` on timeout (default 1800). Includes the assistant text since the prompt
-- `events(session_id, since?)` — one progress line per tool call, tool completion/failure, approval, and finished assistant message. Save `last=#N` and pass it as `since`
+- `events(session_id, since?)` — one progress line per tool call, tool completion/failure, approval, and finished assistant message, from the latest prompt onward (the load replay is skipped). Save `last=#N` and pass it as `since`
 - `read(session_id, since?)` — `#N [user]` / `#N [assistant]`, then `last=#N`
 - `pending_approvals()` — parked tool requests
 - `respond_approval(request_id, option)` — `allow_once`, `allow_always`, or `reject`

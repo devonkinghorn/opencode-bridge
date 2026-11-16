@@ -65,8 +65,8 @@ class Acp:
     def alive(self):
         return self.proc.poll() is None
 
-    def request(self, method, params, timeout=30):
-        _rid, event, box = self.send(method, params)
+    def request(self, method, params, timeout=30, before=None):
+        _rid, event, box = self.send(method, params, before=before)
         if not event.wait(timeout):
             raise TimeoutError(method)
         if "error" in box:
@@ -135,7 +135,8 @@ class Session:
         self.id, self.cwd, self.title, self.agent = sid, cwd, title, agent
         self.messages, self.by_id, self.tools, self.events = [], {}, {}, []
         self.state, self.prompting, self.prompt_rid, self.pending = "idle", False, None, []
-        self.turn_start, self.hub, self.cv = 0, None, threading.Condition()
+        self.turn_start, self.live_from, self.hub, self.cv = 0, 0, None, threading.Condition()
+        self.replaying, self.load_rid = False, None
 
     def add(self, role, text, mid):
         # Chunks with no messageId append to the open message of the same role
@@ -147,7 +148,7 @@ class Session:
             self.messages[-1]["text"] += text
             return
         self.close_assistant()
-        msg = {"n": (self.messages[-1]["n"] + 1) if self.messages else 1, "role": role, "text": text, "open": not mid}
+        msg = {"n": (self.messages[-1]["n"] + 1) if self.messages else 1, "role": role, "text": text, "open": not mid, "replay": bool(self.replaying)}
         self.messages.append(msg)
         if mid:
             self.by_id[mid] = msg
@@ -163,7 +164,7 @@ class Session:
         if len(snippet) > 160:
             snippet = snippet[:160] + "…"
         if snippet and self.hub:
-            self.hub._event(self, "assistant " + snippet)
+            self.hub._event(self, "assistant " + snippet, replay=bool(last.get("replay")))
 
     def last_n(self):
         return self.messages[-1]["n"] if self.messages else 0
@@ -203,7 +204,17 @@ class Hub:
         agent = self.agent(cwd, "")
         self.sessions[session_id] = Session(session_id, agent.cwd, "", agent)
         self.sessions[session_id].hub = self
-        agent.request("session/load", {"sessionId": session_id, "cwd": agent.cwd, "mcpServers": []}, 60)
+        sess = self.sessions[session_id]
+        sess.replaying = True
+        try:
+            agent.request(
+                "session/load",
+                {"sessionId": session_id, "cwd": agent.cwd, "mcpServers": []},
+                60,
+                before=lambda rid: setattr(sess, "load_rid", rid),
+            )
+        finally:
+            sess.replaying = False
         return f"session={session_id} cwd={agent.cwd} state=idle last=#{self.sessions[session_id].last_n()}"
 
     def prompt(self, session_id, text, wait_seconds=None):
@@ -215,6 +226,7 @@ class Hub:
             sess.add("user", text, f"user-{time.time_ns()}")
             sess.prompting, sess.state = True, "running"
             start = sess.turn_start = sess.last_n()
+            sess.live_from = sess.events[-1]["n"] if sess.events else 0
         _rid, event, box = sess.agent.send(
             "session/prompt", {"sessionId": sess.id, "prompt": [{"type": "text", "text": text}]},
             before=lambda rid: setattr(sess, "prompt_rid", rid),
@@ -253,8 +265,9 @@ class Hub:
 
     def events(self, session_id, since=None):
         sess = self._sess(session_id)
-        floor = int(since) if since not in (None, "") else 0
-        lines = [f"#{e['n']} {e['line']}" for e in sess.events if e["n"] > floor]
+        # Default cursor is the prompt, so a load replay is not the turn.
+        floor = sess.live_from if since in (None, "") else int(since)
+        lines = [f"#{e['n']} {e['line']}" for e in sess.events if e["n"] > floor and not e.get("replay")]
         last = sess.events[-1]["n"] if sess.events else 0
         lines.append(f"last=#{last}")
         return "\n".join(lines)
@@ -393,12 +406,17 @@ class Hub:
 
     def on_result(self, agent, request_id):
         for sess in list(self.sessions.values()):
-            if sess.agent is agent and sess.prompt_rid == request_id:
-                with sess.cv:
+            if sess.agent is not agent:
+                continue
+            with sess.cv:
+                if getattr(sess, "load_rid", None) == request_id:
+                    sess.replaying = False
+                    sess.load_rid = None
+                if sess.prompt_rid == request_id:
                     sess.close_assistant()
                     sess.prompting, sess.prompt_rid = False, None
                     sess.state = "waiting" if sess.pending else "idle"
-                    sess.cv.notify_all()
+                sess.cv.notify_all()
 
     def agent(self, cwd, mode):
         path = str(Path(cwd).expanduser().resolve())
@@ -416,17 +434,22 @@ class Hub:
             raise
         return proc
 
-    def _event(self, sess, line):
+    def _event(self, sess, line, replay=None):
+        line = " ".join(str(line).split())
+        if replay is None:
+            replay = bool(sess.replaying)
         n = sess.events[-1]["n"] + 1 if sess.events else 1
-        sess.events.append({"n": n, "line": line})
+        sess.events.append({"n": n, "line": line, "replay": replay})
 
     def _short(self, raw):
         if isinstance(raw, dict):
             for key in ("command", "cmd", "path"):
                 if raw.get(key):
-                    return str(raw[key])[:80]
-            raw = json.dumps(raw)
-        return str(raw or "")[:80]
+                    raw = raw[key]
+                    break
+            else:
+                raw = json.dumps(raw, separators=(",", ":"))
+        return " ".join(str(raw or "").split())[:120]
 
     def _sess(self, session_id):
         sess = self.sessions.get(session_id)
@@ -540,10 +563,11 @@ def _run(argv):
     hub = Hub()
     hub.load_session(args.session, args.cwd)
     hub.prompt(args.session, args.text, wait_seconds=0)
-    sess, seen, deadline = hub._sess(args.session), 0, time.time() + args.timeout
+    sess, deadline = hub._sess(args.session), time.time() + args.timeout
+    seen = sess.live_from
     while True:
         with sess.cv:
-            fresh = [event for event in sess.events if event["n"] > seen]
+            fresh = [event for event in sess.events if event["n"] > seen and not event.get("replay")]
             idle = not sess.prompting and not sess.pending and sess.state != "running"
             if not fresh and not idle and time.time() < deadline:
                 sess.cv.wait(0.2)
